@@ -20,6 +20,7 @@ const (
 	Retry
 )
 
+// Backend holds the data about a server
 type Backend struct {
 	URL          *url.URL
 	Alive        bool
@@ -27,30 +28,35 @@ type Backend struct {
 	ReverseProxy *httputil.ReverseProxy
 }
 
-type ServerPool struct {
-	backends []*Backend
-	current uint64
-}
-
-func (s *ServerPool) NextIndex() int {
-	return int(atomic.AddUint64(&s.current, uint64(1)) % uint64(len(s.backends)))
-}
-
+// SetAlive for this backend
 func (b *Backend) SetAlive(alive bool) {
 	b.mux.Lock()
 	b.Alive = alive
 	b.mux.Unlock()
 }
 
+// IsAlive returns true when backend is alive
 func (b *Backend) IsAlive() (alive bool) {
 	b.mux.RLock()
 	alive = b.Alive
-	b.mux.Unlock()
+	b.mux.RUnlock()
 	return
 }
 
+// ServerPool holds information about reachable backends
+type ServerPool struct {
+	backends []*Backend
+	current  uint64
+}
+
+// AddBackend to the server pool
 func (s *ServerPool) AddBackend(backend *Backend) {
 	s.backends = append(s.backends, backend)
+}
+
+// NextIndex atomically increase the counter and return an index
+func (s *ServerPool) NextIndex() int {
+	return int(atomic.AddUint64(&s.current, uint64(1)) % uint64(len(s.backends)))
 }
 
 // MarkBackendStatus changes a status of a backend
@@ -63,7 +69,9 @@ func (s *ServerPool) MarkBackendStatus(backendUrl *url.URL, alive bool) {
 	}
 }
 
+// GetNextPeer returns next active peer to take a connection
 func (s *ServerPool) GetNextPeer() *Backend {
+	// loop entire backends to find out an Alive backend
 	next := s.NextIndex()
 	l := len(s.backends) + next
 	for i := next; i < l; i++ {
@@ -78,31 +86,7 @@ func (s *ServerPool) GetNextPeer() *Backend {
 	return nil
 }
 
-func GetAttemptsFromContext(r *http.Request) int {
-	if attempts, ok := r.Context().Value(Attempts).(int); ok {
-		return attempts
-	}
-	return 1
-}
-
-func GetRetryFromContext(r *http.Request) int {
-	if retry, ok := r.Context().Value(Retry).(int); ok {
-		return retry
-	}
-	return 0
-}
-
-func isBackendAlive(u *url.URL) bool {
-	timeout := 2 * time.Second
-	conn, err := net.DialTimeout("tcp", u.Host, timeout)
-	if err != nil {
-		log.Println("Site unreachable, error: ", err)
-		return false
-	}
-	_ = conn.Close()
-	return true
-}
-
+// HealthCheck pings the backends and update the status
 func (s *ServerPool) HealthCheck() {
 	for _, b := range s.backends {
 		status := "up"
@@ -115,18 +99,23 @@ func (s *ServerPool) HealthCheck() {
 	}
 }
 
-func healthCheck() {
-	t := time.NewTicker(time.Second * 20)
-	for {
-		select {
-			case <- t.C:
-				log.Println("Starting health check...")
-				serverPool.HealthCheck()
-				log.Println("Health check completed")
-		}
+// GetAttemptsFromContext returns the attempts for request
+func GetAttemptsFromContext(r *http.Request) int {
+	if attempts, ok := r.Context().Value(Attempts).(int); ok {
+		return attempts
 	}
+	return 1
 }
 
+// GetRetryFromContext returns the retries for request
+func GetRetryFromContext(r *http.Request) int {
+	if retry, ok := r.Context().Value(Retry).(int); ok {
+		return retry
+	}
+	return 0
+}
+
+// lb load balances the incoming request
 func lb(w http.ResponseWriter, r *http.Request) {
 	attempts := GetAttemptsFromContext(r)
 	if attempts > 3 {
@@ -143,10 +132,34 @@ func lb(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Service is not available", http.StatusServiceUnavailable)
 }
 
+// isAlive checks whether a backend is Alive by establishing a TCP connection
+func isBackendAlive(u *url.URL) bool {
+	timeout := 2 * time.Second
+	conn, err := net.DialTimeout("tcp", u.Host, timeout)
+	if err != nil {
+		log.Println("Site unreachable, error: ", err)
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// healthCheck runs a routine for check status of the backends every 2 mins
+func healthCheck() {
+	t := time.NewTicker(time.Second * 20)
+	for {
+		select {
+		case <-t.C:
+			log.Println("Starting health check...")
+			serverPool.HealthCheck()
+			log.Println("Health check completed")
+		}
+	}
+}
+
 var serverPool ServerPool
 
 func main() {
-
 	var serverList string
 	var port int
 	flag.StringVar(&serverList, "backends", "", "Load balanced backends, use commas to separate")
@@ -209,5 +222,4 @@ func main() {
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
-
 }
